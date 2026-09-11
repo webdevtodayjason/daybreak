@@ -1,0 +1,6 @@
+[Unit]
+Description=DAYBREAK: wake Tiiny models if gateway is up but models are missing
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/daybreak.env
+ExecStart=/opt/daybreak/deploy/wake-check.sh

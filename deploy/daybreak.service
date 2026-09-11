@@ -1,0 +1,31 @@
+[Unit]
+Description=DAYBREAK API + UI server (:8811)
+Documentation=https://daybreak.example.com
+After=network-online.target
+Wants=network-online.target
+# Runs a week unattended: never let systemd give up after a burst of restarts.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=daybreak
+Group=daybreak
+WorkingDirectory=/opt/daybreak
+EnvironmentFile=/etc/daybreak.env
+# Without this python buffers stdout when not a tty and journald shows nothing for minutes.
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /opt/daybreak/server.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=daybreak
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+# "full" (not "strict") keeps /opt writable for the sqlite WAL sidecar files.
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

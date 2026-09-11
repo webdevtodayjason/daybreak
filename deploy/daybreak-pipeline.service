@@ -1,0 +1,33 @@
+[Unit]
+Description=DAYBREAK ingest + Tiiny NPU enrichment pipeline
+Documentation=https://daybreak.example.com
+After=network-online.target
+Wants=network-online.target
+# Runs a week unattended: never let systemd give up after a burst of restarts.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=daybreak
+Group=daybreak
+WorkingDirectory=/opt/daybreak
+EnvironmentFile=/etc/daybreak.env
+# Without this python buffers stdout when not a tty and journald shows nothing for minutes.
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /opt/daybreak/pipeline.py
+Restart=always
+RestartSec=5
+# SIGTERM is a clean exit; give an in-flight Tiiny inference room to finish.
+KillSignal=SIGTERM
+TimeoutStopSec=45
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=daybreak-pipeline
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+# "full" (not "strict") keeps /opt writable for daybreak.db and its WAL files.
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

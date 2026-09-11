@@ -1,0 +1,28 @@
+# DAYBREAK named-tunnel config  ->  /etc/cloudflared/config.yml
+# Replace <TUNNEL_UUID> with the id printed by `cloudflared tunnel create daybreak`.
+# Full operator walkthrough: TUNNEL.md
+
+tunnel: <TUNNEL_UUID>
+credentials-file: /etc/cloudflared/<TUNNEL_UUID>.json
+
+# Keep the daemon still: the Pi runs a week unattended and an autoupdate
+# restart mid-week is an outage nobody is watching for.
+no-autoupdate: true
+loglevel: info
+metrics: 127.0.0.1:20241
+
+ingress:
+  - hostname: daybreak.example.com
+    service: http://localhost:8811
+    originRequest:
+      connectTimeout: 10s
+      # /cam.mjpg is an endless multipart response. Chunked encoding must stay
+      # ON and the keep-alive long, or cloudflared tears the stream down and the
+      # rack cam flickers back to "CAM OFFLINE" every few seconds.
+      disableChunkedEncoding: false
+      keepAliveTimeout: 300s
+      keepAliveConnections: 16
+      noHappyEyeballs: true
+
+  # Anything else that reaches this tunnel is not ours.
+  - service: http_status:404

@@ -1,0 +1,8 @@
+daybreak.db*
+images/
+digests/
+.daybreak-snap-*
+__pycache__/
+*.pyc
+.DS_Store
+burnin-runs/

@@ -1,0 +1,7 @@
+[Unit]
+Description=DAYBREAK: check every 3 min that the Tiiny models are up
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=3min
+[Install]
+WantedBy=timers.target
