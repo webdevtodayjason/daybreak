@@ -107,7 +107,7 @@ class Speech:
         # device.host() normalises; the old default here was a DIFFERENT address
         # from the one enrich.py used, which is a silently unshared lock waiting
         # for any unit that starts without /etc/daybreak.env.
-        self.base = "http://%s:%d" % (host or device.host(), device.PORT)
+        self.base = "http://%s:%d" % (host or device.host(), device.port())
         self.key = key or os.environ.get("TIINY_KEY", "")
         self._started = False
 

@@ -260,7 +260,7 @@ class Tiiny:
         self.host = device.host() if host is None else \
             host.replace("http://", "").replace("https://", "").strip("/ ") \
                 .split("/")[0].split(":")[0]
-        self.base_url = "http://%s:%d" % (self.host, device.PORT)
+        self.base_url = "http://%s:%d" % (self.host, device.port())
         # No baked-in credential: the key comes from the environment (/etc/daybreak.env,
         # mode 0640) or nowhere. An empty key must fail loudly at call time so a
         # misconfigured deploy is visible instead of silently authenticating.

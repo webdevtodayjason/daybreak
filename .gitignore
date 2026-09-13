@@ -6,3 +6,6 @@ __pycache__/
 *.pyc
 .DS_Store
 burnin-runs/
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/graft/
