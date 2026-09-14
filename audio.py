@@ -108,8 +108,13 @@ class Speech:
         # from the one enrich.py used, which is a silently unshared lock waiting
         # for any unit that starts without /etc/daybreak.env.
         self.base = "http://%s:%d" % (host or device.host(), device.port())
-        self.key = key or os.environ.get("TIINY_KEY", "")
+        self._key = key or None
         self._started = False
+
+    @property
+    def key(self):
+        """Live, not snapshotted: same reason as enrich.Tiiny.key."""
+        return self._key or device.key()
 
     def _req(self, path, body=None, method=None, timeout=30.0, raw=False):
         # Same split as enrich.py: speech synthesis occupies the NPU and takes the

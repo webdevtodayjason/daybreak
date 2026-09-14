@@ -260,25 +260,98 @@ except Exception:                          # library absent: nothing can raise i
     class DeviceBusy(RuntimeError):
         pass
 
+class LocalLane:
+    """The lease when onelane is not installed. One process only, and honest about it.
+
+    The README has always said Daybreak runs without onelane and simply cannot
+    coordinate with other apps. It did not: every device call goes through lease(),
+    lease() went straight to `import onelane`, and a tree without onelane.py beside it
+    raised ModuleNotFoundError on the first article. The supervised loop caught it,
+    called the device unreachable and backed off, so a clean clone collected news
+    forever and analysed none of it. An install from tiinyapp.farm is exactly that
+    clone.
+
+    A reentrant lock is the honest stand-in. It serialises every thread in this
+    process, which is the whole story for `daybreak --serve`, where the wall and the
+    pipeline are one process and the ten device-calling threads are all in it. It
+    cannot see a second process, so the Pi's two units still want the real library,
+    and install.sh still puts it there. The record who() returns has the same shape
+    the board reads, with queue counted from the threads actually waiting.
+    """
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._state = threading.Lock()
+        self._depth = 0
+        self._why = None
+        self._since = 0.0
+        self._waiting = 0
+
+    @contextlib.contextmanager
+    def hold(self, why=None, wait=None):
+        with self._state:
+            self._waiting += 1
+        try:
+            got = (self._lock.acquire(timeout=wait) if wait and wait > 0
+                   else self._lock.acquire())
+        finally:
+            with self._state:
+                self._waiting -= 1
+        if not got:
+            raise DeviceBusy("waited %.0fs for the device and it is still busy"
+                             % (wait or 0))
+        with self._state:
+            self._depth += 1
+            previous_why, previous_since = self._why, self._since
+            if self._depth == 1:
+                self._since = time.time()
+            self._why = why
+        try:
+            yield
+        finally:
+            with self._state:
+                self._depth -= 1
+                self._why, self._since = previous_why, previous_since
+            self._lock.release()
+
+    def who(self, **_ignored):
+        """Read without taking the lock, so a monitor never delays an inference."""
+        with self._state:
+            held = self._depth > 0
+            return {"held": held, "owner": UNIT if held else None,
+                    "why": self._why if held else None,
+                    "since": self._since if held else None,
+                    "held_for_s": round(time.time() - self._since, 3) if held else 0.0,
+                    "queue": self._waiting, "local": True}
+
+
 _ts = None
 _ts_lock = threading.Lock()
 
 
 def onelane():
-    """The one OneLane for this process, or None if the library is missing.
+    """The one lane for this process: the real OneLane, or the local stand-in.
 
     One object per process matters: onelane keeps a registry keyed on the lock path,
     so all ten threads share a single lock object. Intra-process contention resolves on
     an in-memory RLock with no filesystem traffic, and only genuine cross-process
-    contention reaches flock.
+    contention reaches flock. The stand-in has the same property and stops there.
     """
     global _ts
     if _ts is None:
         with _ts_lock:
             if _ts is None:
-                import onelane as _t
-                _ts = _t.OneLane(host=host(), key=key(), owner=UNIT)
+                try:
+                    import onelane as _t
+                    _ts = _t.OneLane(host=host(), key=key(), owner=UNIT)
+                except Exception:      # noqa: BLE001 - absent, or refuses to build
+                    _ts = LocalLane()
     return _ts
+
+
+def coordinated():
+    """True when the real library is in use and other processes can be seen."""
+    return not isinstance(onelane(), LocalLane)
 
 
 @contextlib.contextmanager
@@ -294,6 +367,9 @@ def lease(why, wait=LEASE_WAIT):
 
 def holder():
     """Who holds the device right now, without taking the lock. Safe to poll."""
+    lane = onelane()
+    if isinstance(lane, LocalLane):
+        return lane.who()
     import onelane as _t
     return _t.who(host=host())
 
@@ -351,4 +427,18 @@ if __name__ == "__main__":
     os.remove(FARM_DEVICE)
     os.rmdir(_scratch)
     FARM_DEVICE = _real_farm_device
-    print("device.py self-check OK -> %s, locks in %s" % (base_url(), LOCK_DIR))
+
+    # The lease has to work with no onelane installed, because that is what an install
+    # from tiinyapp.farm looks like. Nesting to depth 2 is the case that matters: a
+    # story thread holds the lease and calls down into enrich(), which takes it again.
+    _lane = LocalLane()
+    assert _lane.who()["held"] is False
+    with _lane.hold(why="outer"):
+        assert _lane.who()["held"] is True and _lane.who()["why"] == "outer"
+        with _lane.hold(why="inner"):
+            assert _lane.who()["why"] == "inner", _lane.who()
+        assert _lane.who()["why"] == "outer", _lane.who()
+    assert _lane.who()["held"] is False and _lane.who()["queue"] == 0
+
+    print("device.py self-check OK -> %s, locks in %s, lane %s"
+          % (base_url(), LOCK_DIR, "onelane" if coordinated() else "local (no onelane)"))

@@ -385,7 +385,7 @@ def _device_ready():
         # db.mark_error's retry budget is the backstop.
         return True
     for m in models:
-        if str((m or {}).get("model_id") or "").strip() == enrich.CHAT_MODEL:
+        if str((m or {}).get("model_id") or "").strip() == tiiny().chat_model():
             status = str((m or {}).get("status") or "").strip().lower()
             return not any(bad in status for bad in _BAD_MODEL_STATUS)
     return False

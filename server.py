@@ -49,10 +49,6 @@ BIND = os.environ.get("BIND", "127.0.0.1")
 DB_PATH = os.environ.get("DAYBREAK_DB") or os.path.join(BASE_DIR, "daybreak.db")
 CAM_URL = (os.environ.get("CAM_URL") or "http://127.0.0.1:8812").rstrip("/")
 TIINY_BASE = device.base_url()
-# device.key() so an install from tiinyapp.farm works without an env file: the farm
-# already asked for the key once and wrote it to ~/.tiinyapps/device.json. It is read
-# here, sent to the device, and printed nowhere; the browser only ever sees /api/*.
-TIINY_KEY = device.key()
 IMAGE_MODEL = os.environ.get("IMAGE_MODEL", "Tongyi-MAI/Z-Image-Turbo")
 PUBLIC_BASE = (os.environ.get("DAYBREAK_PUBLIC_BASE") or "https://daybreak.example.com").rstrip("/")
 SITE_DESC_FALLBACK = "Daily world-news brief, written and spoken on a Tiiny Pocket edge device."
@@ -238,7 +234,7 @@ def generate_image(item_id, title, summary):
         "steps": 8}).encode()
     req = urllib.request.Request(
         TIINY_BASE + "/v1/image/generate", data=body,
-        headers={"Authorization": "Bearer " + TIINY_KEY,
+        headers={"Authorization": "Bearer " + device.key(),
                  "Content-Type": "application/json"})
     # THE collision this whole exercise is about: a reader clicking an article fires
     # this from the server process while the pipeline may be 200 seconds into a story.
@@ -286,7 +282,7 @@ def rerank_passages(question, results, keep=12):
                        "documents": [d for _, d in docs]}).encode()
     req = urllib.request.Request(
         TIINY_BASE + "/v1/rerank", data=body,
-        headers={"Authorization": "Bearer " + TIINY_KEY,
+        headers={"Authorization": "Bearer " + device.key(),
                  "Content-Type": "application/json"})
     try:
         with device.lease("%s rerank" % device.UNIT):
@@ -916,7 +912,7 @@ class Handler(BaseHTTPRequestHandler):
         req = urllib.request.Request(
             "http://%s:%s/kb/retrieve" % (host, kb_port),
             data=json.dumps({"question": question}).encode(),
-            headers={"Authorization": "Bearer " + TIINY_KEY,
+            headers={"Authorization": "Bearer " + device.key(),
                      "Content-Type": "application/json"})
         try:
             with urllib.request.urlopen(req, timeout=45) as resp:

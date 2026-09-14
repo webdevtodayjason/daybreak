@@ -24,8 +24,17 @@ try:
 except Exception:  # pragma: no cover - import-time robustness only
     _db = None
 
-CHAT_MODEL = "deepreinforce-ai/Ornith-1.0-35B"
-EMBED_MODEL = "Qwen/Qwen3-Embedding-0.6B"
+# The models this was built against, and the ones it asks for first. They are a
+# preference, not a requirement: the board on the rack runs Ornith, and somebody
+# installing from tiinyapp.farm has whatever they have. Daybreak asks the device what
+# is loaded and uses that, which is what the catalog listing says it does.
+CHAT_MODEL = os.environ.get("TIINY_CHAT_MODEL") or "deepreinforce-ai/Ornith-1.0-35B"
+EMBED_MODEL = os.environ.get("TIINY_EMBED_MODEL") or "Qwen/Qwen3-Embedding-0.6B"
+
+# Model ids that are never a chat model, however the device names them. Matched on the
+# lowercased id, so "Qwen/Qwen3-Embedding-0.6B" and "Z-Image-Turbo" both land here.
+_NOT_CHAT = ("embedding", "embed", "-tts", "tts-", "rerank", "image", "whisper",
+             "speech", "voice")
 
 # The device does not batch; under a concurrent load generator a single completion can
 # take 20-60s+, and the thinking-retry path generates up to 1600 tokens at ~26 tok/s.
@@ -261,11 +270,76 @@ class Tiiny:
             host.replace("http://", "").replace("https://", "").strip("/ ") \
                 .split("/")[0].split(":")[0]
         self.base_url = "http://%s:%d" % (self.host, device.port())
-        # No baked-in credential: the key comes from the environment (/etc/daybreak.env,
-        # mode 0640) or nowhere. An empty key must fail loudly at call time so a
-        # misconfigured deploy is visible instead of silently authenticating.
-        self.key = key or os.environ.get("TIINY_KEY", "")
+        # No baked-in credential: the key comes from TIINY_KEY (/etc/daybreak.env,
+        # mode 0640) or from ~/.tiinyapps/device.json, or nowhere. An empty key must
+        # fail loudly at call time so a misconfigured deploy is visible instead of
+        # silently authenticating. Asked per call rather than snapshotted here: this
+        # object is built once per process and lives for weeks, and somebody can run
+        # farm device while it is running.
+        self._key = key or None
         self.timeout = float(timeout or TIMEOUT)
+        self._models = None
+        self._model_lock = threading.Lock()
+
+    @property
+    def key(self):
+        """A property, so every caller keeps reading `.key` and gets a live answer.
+
+        Asked per call rather than snapshotted in __init__: this object is built once
+        per process and lives for weeks, and somebody can run farm device while it is
+        running. Read, sent to the device, and printed nowhere.
+        """
+        return self._key or device.key()
+
+    # -- which models ----------------------------------------------------
+    def models(self, refresh=False):
+        """Every model id the device is serving, or [] if it will not say.
+
+        Cached: this is asked once per process on the first chat call, and again only
+        when the preferred model stops answering. It is a metadata read, so it does not
+        take the lease and cannot queue behind an inference.
+        """
+        with self._model_lock:
+            if self._models is not None and not refresh:
+                return self._models
+        found = []
+        try:
+            body = self._raw("/v1/models", None, min(self.timeout, 15), "GET") or {}
+            rows = body.get("data") if isinstance(body, dict) else body
+            for row in rows or []:
+                name = str((row or {}).get("id") or "").strip()
+                if name:
+                    found.append(name)
+        except Exception:            # noqa: BLE001 - no device, no key, old firmware
+            found = []
+        with self._model_lock:
+            self._models = found
+        return found
+
+    def chat_model(self, refresh=False):
+        """The preferred chat model if the device has it, else the first one that is.
+
+        A device without Ornith on it is the normal case off the rack, and a hard-coded
+        model id there is a 404 on every article with nothing in the log to say why.
+        """
+        available = self.models(refresh=refresh)
+        if not available or CHAT_MODEL in available:
+            return CHAT_MODEL
+        for name in available:
+            lowered = name.lower()
+            if not any(word in lowered for word in _NOT_CHAT):
+                return name
+        return CHAT_MODEL
+
+    def embed_model(self, refresh=False):
+        """The preferred embedder if present, else anything that looks like one."""
+        available = self.models(refresh=refresh)
+        if not available or EMBED_MODEL in available:
+            return EMBED_MODEL
+        for name in available:
+            if "embed" in name.lower():
+                return name
+        return EMBED_MODEL
 
     # -- transport -------------------------------------------------------
     def _request(self, path, payload=None, timeout=None, method=None):
@@ -281,12 +355,13 @@ class Tiiny:
             return self._raw(path, payload, timeout, method)
 
     def _raw(self, path, payload=None, timeout=None, method=None):
-        if not self.key:
-            raise RuntimeError("TIINY_KEY unset — no device credential configured")
+        credential = self.key
+        if not credential:
+            raise RuntimeError("no device credential: set TIINY_KEY or run farm device")
         url = self.base_url + path
         data = None
         headers = {
-            "Authorization": "Bearer %s" % self.key,
+            "Authorization": "Bearer %s" % credential,
             "Accept": "application/json",
             "User-Agent": "daybreak/1.0",
         }
@@ -321,9 +396,10 @@ class Tiiny:
             (max(int(max_tokens) * 3, 2400), False),
         ]
         last_err = "unknown"
+        model = self.chat_model()
         for budget, nothink in attempts:
             payload = {
-                "model": CHAT_MODEL,
+                "model": model,
                 "messages": messages,
                 "max_tokens": budget,
                 "temperature": 0.2,
@@ -379,7 +455,7 @@ class Tiiny:
             # Short timeout: a 0.6B embed is sub-second, and this sits in the serial
             # enrich queue -- never let it stall the loop for the full chat timeout.
             body = self._request(
-                "/v1/embeddings", {"model": EMBED_MODEL, "input": text},
+                "/v1/embeddings", {"model": self.embed_model(), "input": text},
                 timeout=min(self.timeout, 60))
             vec = ((body.get("data") or [{}])[0]).get("embedding")
             if not vec:

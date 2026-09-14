@@ -1710,6 +1710,19 @@ def _selfcheck():
 
     ctx = Ctx(tiiny=_Dev(), log=lambda m: None, db_path=path)
 
+    # job_audio starts the TTS model on a real device and streams a wav back, so it
+    # cannot run in a check that has no device. _Dev answers chat and nothing else, and
+    # audio is second in the priority order, so leaving it due made this pass spend 38
+    # seconds timing out against whatever address the box thinks the Tiiny is at, then
+    # fail the "brief then recluster" assertion because audio had taken recluster's
+    # turn. It is held not-due for the whole check instead.
+    DEVICE_FREE = tuple(job.name for job in JOBS if job.name != "audio")
+
+    def reset_clocks(value=0.0):
+        """Every job this check can actually run, back to `value`; audio stays parked."""
+        for job in JOBS:
+            _stamp(con, job.name, value if job.name in DEVICE_FREE else time.time())
+
     # seed a finished UTC day (for the brief) plus a live 24h window (for the
     # synthesis/dossier jobs, which both read the last day only)
     day = utc_day(now - 86400)
@@ -1725,13 +1738,46 @@ def _selfcheck():
         db.mark_enriched(con, iid, "Live summary %d." % i, "conflict", "CENTCOM",
                          5 if i % 4 == 0 else 3, json.dumps(["Ruritania"]), None)
 
-    # 1. queue gate
-    bad = db.insert_item(con, "https://ex.test/pending", "SMOKE", "Pending", now, "r")
-    assert bad and queue_pending(con) == 1
+    # 1. the fairness gate. This used to assert the original rule, that ANY pending
+    # item stops every background job. run_due stopped working that way when the feed
+    # list reached 59 sources and the queue stopped ever being empty: the rule is now
+    # that a DEEP queue defers background work, and background work gets a turn anyway
+    # once it has been starved for BG_STARVE_S. The test kept asserting the old rule
+    # and had been failing ever since, on a fresh database, for two reasons at once.
+    #
+    # The second one is worth naming. meta.jobs_last_bg is absent on a new database,
+    # _meta_float reads that as 0.0, and starved is then the whole Unix epoch, so the
+    # starvation escape fires on the first pass however deep the queue is. That is the
+    # right behaviour for a real box and it means a test of the queue gate has to stamp
+    # the clock first, which is the part that made this look like a code bug.
+    for i in range(BG_PENDING_OK + 1):
+        assert db.insert_item(con, "https://ex.test/pending/%d" % i, "SMOKE",
+                              "Pending %d" % i, now, "r")
+    assert queue_pending(con) == BG_PENDING_OK + 1, queue_pending(con)
+    db.set_meta(con, "jobs_last_bg", "%.3f" % time.time())
     res = run_due(con, ctx)
     assert res["ran"] is None and res["skipped"] == "queue", res
-    db.mark_enriched(con, bad, "s", "politics", "GLOBAL", 1, "[]", None)
+
+    # Starved long enough, and the same deep queue no longer defers anything. Every
+    # job is stamped as just run for this one pass, so the gate is what is measured
+    # and no document is written that the steps below would then find already done.
+    reset_clocks(time.time())
+    db.set_meta(con, "jobs_last_bg", "%.3f" % (time.time() - BG_STARVE_S - 1))
+    res = run_due(con, ctx)
+    assert res["ran"] is None and res["skipped"] == "nothing due", res
+    reset_clocks()
+
+    # A shallow queue never defers anything, whatever the clock says. The gate rows go
+    # away rather than getting enriched: as GLOBAL/politics they would have been a
+    # second region with enough material, and the synthesis cooldown check below asks
+    # for exactly one.
+    with con:
+        con.execute("DELETE FROM items WHERE url LIKE 'https://ex.test/pending/%'")
     assert queue_pending(con) == 0
+    db.set_meta(con, "jobs_last_bg", "%.3f" % time.time())
+    reset_clocks(time.time())
+    assert run_due(con, ctx).get("skipped") == "nothing due"
+    reset_clocks()
 
     # 2. brief
     assert brief_day_due(con) == day, brief_day_due(con)
@@ -1828,8 +1874,7 @@ def _selfcheck():
     assert md.count("alpha") == 1, md
 
     # 7. scheduler picks one job per pass and stamps it
-    for j in JOBS:
-        _set(con, "job_last_" + j.name, "0")
+    reset_clocks()
     res = run_due(con, ctx)
     assert res["ran"] == "brief", res           # priority order
     assert _last_run(con, "brief") > 0
