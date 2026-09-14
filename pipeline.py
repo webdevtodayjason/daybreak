@@ -41,8 +41,16 @@ import db  # noqa: E402
 import enrich  # noqa: E402
 import feeds  # noqa: E402
 import jobs  # noqa: E402
-import r2  # noqa: E402
 import device
+
+try:
+    import r2  # noqa: E402
+except Exception:  # pragma: no cover - the release archive leaves r2.py out
+    # Offsite sync is opt-in and inert without R2_* credentials, so the tar.gz that
+    # goes to tiinyapp.farm does not carry it. Everything below already asks
+    # r2.from_env() whether it is configured; a missing module is one more way of
+    # answering no. The repo still has the file, and a clone still syncs.
+    r2 = None
 
 DB_PATH = os.environ.get("DAYBREAK_DB") or os.path.join(BASE_DIR, "daybreak.db")
 
@@ -60,6 +68,12 @@ R2_INTERVAL = float(os.environ.get("DAYBREAK_R2_INTERVAL", "900"))
 ENRICH_BATCH = 20
 IDLE_SLEEP = 2.0           # queue empty
 CLUSTER_REFRESH_S = 60.0   # how often to re-read cluster labels/counts
+# How long the device-facing loops wait when there is no device to face. Long enough
+# that a box with no Tiiny is quiet, short enough that plugging one in and running
+# farm device is noticed within a minute.
+NO_DEVICE_SLEEP = 30.0
+NO_DEVICE_NOTICE_S = 900.0
+_no_device_said = 0.0
 CLUSTER_WINDOW_S = 72 * 3600.0
 LABEL_MIN_ITEMS = 3
 LABEL_PER_PASS = 3
@@ -470,6 +484,15 @@ def enrich_body(con):
     if time.time() - _last_cluster_refresh > CLUSTER_REFRESH_S:
         _refresh_cluster_state(con)
 
+    # No device means wait, not fail. Running the queue against nothing would stamp
+    # enrich_error on every article it touched, and those rows never come back: the
+    # pending query skips anything with an error set, so a day without a key would
+    # permanently cost a day of analysis. The articles keep arriving and keep their
+    # turn; the moment somebody names a device the queue drains in order.
+    if not device.configured():
+        _no_device_notice()
+        return NO_DEVICE_SLEEP
+
     rows = db.pending_items(con, limit=ENRICH_BATCH)
     if not rows:
         return IDLE_SLEEP
@@ -528,8 +551,24 @@ _DEVICE_METRICS = (
 )
 
 
+def _no_device_notice():
+    """One line every quarter hour, not one every loop. Never prints a key."""
+    global _no_device_said
+    now = time.time()
+    if now - _no_device_said < NO_DEVICE_NOTICE_S:
+        return
+    _no_device_said = now
+    log("waiting for a Tiiny: set TIINY_HOST and TIINY_KEY, or run farm device. "
+        "Articles are still being collected and keep their place in the queue.")
+
+
 def device_body(con):
     global _embed_probed, _device_misses
+    # Nothing to poll, and polling the built-in default would be somebody else's
+    # address on somebody else's network every five seconds.
+    if not device.configured():
+        _no_device_notice()
+        return NO_DEVICE_SLEEP
     # Flush whatever the device client generated since the last pass, from every thread
     # and every job. This runs every 5s, so the odometer is never far behind.
     try:
@@ -623,7 +662,7 @@ def _handle_signal(signum, _frame):
 def run_once():
     """One pass of every loop, sequential. For integrator verification."""
     global _R2
-    if _R2 is None:
+    if _R2 is None and r2 is not None:
         _R2 = r2.from_env()
     con = db.connect(DB_PATH)
     try:
@@ -645,9 +684,7 @@ def run_once():
 # --------------------------------------------------------------------------- #
 
 VAULT_CHECK_S = 900.0
-KB_HOST = device.host()
 KB_PORT = os.environ.get("TIINY_KB_PORT", "5003")
-KB_KEY = os.environ.get("TIINY_KEY", "")
 
 ABOUT_DOC = """# DAYBREAK — project brief
 
@@ -683,8 +720,10 @@ AI-generated on-device and can be wrong.
 
 def _kb_call(path, payload=None, raw_body=None, content_type=None, timeout=60):
     import urllib.request
-    url = "http://%s:%s%s" % (KB_HOST, KB_PORT, path)
-    headers = {"Authorization": "Bearer " + KB_KEY}
+    # Asked fresh rather than snapshotted at import: somebody can run farm device
+    # after the pipeline is already up, and the next call should find the box.
+    url = "http://%s:%s%s" % (device.host(), KB_PORT, path)
+    headers = {"Authorization": "Bearer " + device.key()}
     data = None
     if raw_body is not None:
         data = raw_body
@@ -718,10 +757,11 @@ def _vault_file(con, filename, text):
     # Drop a local copy so the offsite loop can ship it. Best-effort by design:
     # the device KB is the primary home, R2 is the backup, and a full disk here
     # must not fail a digest that already landed on the device.
-    try:
-        r2.write_digest_copy(text, filename, db_path=DB_PATH)
-    except Exception as exc:
-        log("[vault] digest copy for r2 failed: %s" % str(exc)[:100])
+    if r2 is not None:
+        try:
+            r2.write_digest_copy(text, filename, db_path=DB_PATH)
+        except Exception as exc:
+            log("[vault] digest copy for r2 failed: %s" % str(exc)[:100])
     _bump_meta(con, "vault_digests_total", 1)
     log("[vault] filed %s (%d entries)" % (filename, fin.get("generated_entries") or 0))
     return True
@@ -768,7 +808,8 @@ def _build_digest(con, start_ts, end_ts, day_label, partial=False):
 
 
 def vault_body(con):
-    if not KB_KEY:
+    if not device.configured():
+        _no_device_notice()
         return None
     now = time.time()
     # one-time bootstrap: project brief + today-so-far partial digest
@@ -988,7 +1029,8 @@ def idle_body(con):
     jobs.run_due, which picks at most ONE job per pass, re-checks the pending
     queue itself and takes the NPU lease around every device call.
     """
-    if not KB_KEY:
+    if not device.configured():
+        _no_device_notice()
         return None
     # only work when the enrichment queue is quiet — enrichment always wins
     pending = 0
@@ -1080,16 +1122,26 @@ def r2_body(con):
     return None
 
 
-def main():
+def prepare():
+    """Say what we are about to do, settle the offsite question, stamp the DB.
+
+    Split out of main() so the one-process launcher (`daybreak --serve`) runs the
+    same startup as `python3 pipeline.py` rather than a second copy of it that can
+    drift away from this one.
+    """
     global _R2
-    log("daybreak pipeline start db=%s tiiny=%s"
-        % (DB_PATH, device.host()))
-    if not os.environ.get("TIINY_KEY"):
-        log("WARNING TIINY_KEY unset — enrichment will fail until it is set")
+    log("daybreak pipeline start db=%s tiiny=%s" % (DB_PATH, device.host()))
+    if not device.configured():
+        # Not an error and not fatal: the wall serves, the feeds still land in the
+        # archive, and the enricher parks until somebody names a device.
+        log("no Tiiny configured (no TIINY_HOST/TIINY_KEY and no ~/.tiinyapps/"
+            "device.json). Fetching will run, enrichment waits")
 
     # Offsite sync is opt-in: no R2_* env, no thread, no DB writes, nothing.
-    _R2 = r2.from_env()
-    if _R2 is None:
+    _R2 = r2.from_env() if r2 is not None else None
+    if r2 is None:
+        log("r2 offsite sync not present in this build (inert)")
+    elif _R2 is None:
         gaps = r2.missing_env()
         if gaps and len(gaps) < 4:
             # a PARTIAL config is a typo in /etc/daybreak.env, not a decision
@@ -1108,16 +1160,9 @@ def main():
         log("startup db init failed %s: %s (threads will retry)"
             % (type(exc).__name__, exc))
 
-    if "--once" in sys.argv[1:]:
-        run_once()
-        return 0
 
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        try:
-            signal.signal(sig, _handle_signal)
-        except (ValueError, OSError):
-            pass
-
+def start_background():
+    """Spawn every loop thread, started, and hand them back."""
     threads = [
         _spawn("fetch", fetch_body, FETCH_INTERVAL),
         _spawn("enrich", enrich_body, IDLE_SLEEP),
@@ -1134,10 +1179,12 @@ def main():
     log("device %s; locks %s; peers visible: %s"
         % (device.host(), device.LOCK_DIR, ", ".join(sorted(peers)) or "none yet"))
     log("threads up: %s" % ", ".join(t.name for t in threads))
+    return threads
 
-    while not STOP.wait(1.0):
-        pass
 
+def stop_background(threads):
+    """Ask every loop to stop and wait a bounded time for it."""
+    STOP.set()
     for th in threads:
         th.join(timeout=10.0)
     # The enricher can be parked in a 20-60s device call when SIGTERM lands. It is a
@@ -1149,6 +1196,27 @@ def main():
         log("abandoning mid-flight thread(s): %s (daemon; no write in progress)"
             % ", ".join(stragglers))
     log("daybreak pipeline stopped")
+
+
+def main():
+    prepare()
+
+    if "--once" in sys.argv[1:]:
+        run_once()
+        return 0
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, _handle_signal)
+        except (ValueError, OSError):
+            pass
+
+    threads = start_background()
+
+    while not STOP.wait(1.0):
+        pass
+
+    stop_background(threads)
     return 0
 
 

@@ -51,6 +51,7 @@ Env: TIINY_HOST, TIINY_KEY, DAYBREAK_DB, IMAGE_MODEL, plus the DAYBREAK_*_INTERV
 overrides below. Stdlib only.
 """
 
+import calendar
 import json
 import os
 import re
@@ -417,7 +418,10 @@ def utc_day(ts=None):
 def day_bounds(day):
     """UTC midnight-to-midnight epoch bounds for 'YYYY-MM-DD'."""
     t = time.strptime(day, "%Y-%m-%d")
-    start = int(__import__("calendar").timegm(t))
+    # calendar is imported at the top rather than inline: a dynamic __import__ is
+    # one of the things tiinyapp.farm's archive scanner refuses, and it was only
+    # ever inline to keep the import list short.
+    start = int(calendar.timegm(t))
     return float(start), float(start + 86400)
 
 

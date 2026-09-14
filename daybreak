@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+"""Daybreak in one process: the wall, and the pipeline that fills it.
+
+Two commands is the right shape on a Pi, where systemd wants one unit per thing it
+restarts, and the wrong shape everywhere else. tiinyapp.farm starts an app by
+running one command and stops it by signalling one process, so this is that
+command. It spawns the pipeline's loop threads, then serves the wall on the main
+thread, and Ctrl-C or SIGTERM stops both.
+
+    daybreak --serve                 the wall on 8811, pipeline behind it
+    daybreak --serve --port 7871     somewhere else
+    daybreak --selfcheck             no device, no network, exits 0
+
+`python3 pipeline.py` and `python3 server.py` still work exactly as the README
+says. Nothing here replaces them; it runs the same two things in one process.
+
+The port comes from --port, then TIINYAPP_PORT (which the farm always sets), then
+PORT, then 8811. server.py reads PORT at import, so this script settles the
+question into the environment before importing anything.
+"""
+
+import os
+import sys
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+
+from version import VERSION  # noqa: E402
+
+USAGE = """daybreak %s - a live world-news wall that thinks on your Tiiny
+
+  daybreak --serve [--port N]   run the wall and the pipeline in one process
+  daybreak --selfcheck          build a database, serve it, check it, exit
+  daybreak --version            print the version
+  daybreak --help               this
+
+Environment: TIINY_HOST and TIINY_KEY name the device, and ~/.tiinyapps/device.json
+answers when they do not. DAYBREAK_DB says where the database lives. With no device
+at all the wall still serves and says so; the pipeline waits for one.
+""" % VERSION
+
+
+def fail(message):
+    sys.stderr.write("daybreak: %s\n" % message)
+    return 2
+
+
+def parse(argv):
+    """(port or None, selfcheck) from our own small flag set, or an exit code.
+
+    Hand-rolled rather than argparse because the farm appends --selfcheck to the
+    entry command as it stands, so this has to accept `--serve --port 7871
+    --selfcheck` and do the sensible thing with it.
+    """
+    port, selfcheck, index = None, False, 0
+    while index < len(argv):
+        argument = argv[index]
+        if argument in ("-h", "--help"):
+            sys.stdout.write(USAGE)
+            return 0
+        if argument in ("-V", "--version"):
+            sys.stdout.write(VERSION + "\n")
+            return 0
+        if argument == "--selfcheck":
+            selfcheck = True
+        elif argument == "--serve":
+            pass
+        elif argument == "--port":
+            index += 1
+            if index >= len(argv):
+                return fail("--port needs a number")
+            port = argv[index]
+        elif argument.startswith("--port="):
+            port = argument.split("=", 1)[1]
+        else:
+            return fail("unknown option %s (try --help)" % argument)
+        index += 1
+    if port is not None:
+        if not port.isdigit() or not 1 <= int(port) <= 65535:
+            return fail("--port takes a number from 1 to 65535, not %r" % port)
+        port = int(port)
+    return port, selfcheck
+
+
+def choose_port(port):
+    for value in (port, os.environ.get("TIINYAPP_PORT"), os.environ.get("PORT")):
+        if value is None or value == "":
+            continue
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= number <= 65535:
+            return number
+    return 8811
+
+
+def choose_db():
+    """Where the database goes, and whether we had to move it.
+
+    DAYBREAK_DB wins. Under the farm, FARM_DATA_DIR is the directory that survives
+    an update of the app, so the archive belongs there rather than beside code that
+    gets replaced. Otherwise beside the scripts, which is what the README says and
+    what anyone who cloned the repo expects.
+    """
+    told = os.environ.get("DAYBREAK_DB")
+    if told:
+        return told, ""
+    data = os.environ.get("FARM_DATA_DIR") or os.environ.get("TIINY_DATA_DIR")
+    if data and os.path.isdir(data) and os.access(data, os.W_OK):
+        return os.path.join(data, "daybreak.db"), ""
+    if os.access(BASE_DIR, os.W_OK):
+        return os.path.join(BASE_DIR, "daybreak.db"), ""
+    import tempfile
+    moved = tempfile.mkdtemp(prefix="daybreak-")
+    return os.path.join(moved, "daybreak.db"), (
+        "%s is read-only, so the database is in %s and will not outlive this run"
+        % (BASE_DIR, moved))
+
+
+def selfcheck():
+    """Build a database, serve the wall on a spare loopback port, read it back.
+
+    No device, no network, nothing written beside the code: CI runs this in a
+    read-only container with no route off the machine, and so can you.
+    """
+    import tempfile
+
+    home = tempfile.mkdtemp(prefix="daybreak-selfcheck-")
+    os.environ["DAYBREAK_DB"] = os.path.join(home, "daybreak.db")
+    # The probe in device.py costs two connection timeouts against whatever the
+    # box thinks the device is, and there is no device in a selfcheck.
+    os.environ.setdefault("TIINY_PORT", "8800")
+    import device
+    import pipeline
+    import server
+    print("daybreak %s selfcheck" % VERSION)
+    print("  database                 %s" % os.environ["DAYBREAK_DB"])
+    print("  device configured        %s" % ("yes" if device.configured() else "no"))
+    # Both halves, not just the wall. The pipeline is where the optional modules are
+    # imported, so this is the check that notices one of them being genuinely needed
+    # rather than optional. prepare() opens the database and stamps it; it starts no
+    # threads and makes no device call.
+    pipeline.prepare()
+    code = server.selfcheck()
+    if os.path.exists(os.environ["DAYBREAK_DB"]):
+        print("  database written         %d bytes"
+              % os.path.getsize(os.environ["DAYBREAK_DB"]))
+    else:
+        print("  database written         NO  <-- UNEXPECTED")
+        code = 1
+    print("daybreak selfcheck %s" % ("OK" if code == 0 else "FAILED"))
+    return code
+
+
+def serve(port):
+    import device
+    database, moved_note = choose_db()
+    os.environ["DAYBREAK_DB"] = database
+    os.environ["PORT"] = str(port)
+
+    import pipeline
+    import server
+
+    print("daybreak %s: wall on port %d, pipeline in the same process"
+          % (VERSION, port))
+    if moved_note:
+        print("daybreak: %s" % moved_note)
+    if device.configured():
+        print("daybreak: device %s, from %s" % (device.base_url(), device.source()))
+    else:
+        print("daybreak: no Tiiny configured, so nothing will be enriched yet. "
+              "Set TIINY_HOST and TIINY_KEY, or run farm device. The wall serves "
+              "either way and says so on the page.")
+
+    pipeline.prepare()
+    threads = pipeline.start_background()
+    try:
+        return server.main()
+    finally:
+        pipeline.stop_background(threads)
+
+
+def main(argv):
+    parsed = parse(argv)
+    if isinstance(parsed, int):
+        return parsed
+    port, wants_selfcheck = parsed
+    if wants_selfcheck:
+        return selfcheck()
+    return serve(choose_port(port))
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(0)

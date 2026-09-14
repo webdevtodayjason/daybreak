@@ -2,7 +2,7 @@
 
 **A live world-news wall that thinks entirely on your Tiiny. Nothing leaves your house.**
 
-Daybreak pulls world news from 14 free feeds every five minutes and hands every single
+Daybreak pulls world news from 59 free feeds every five minutes and hands every single
 article to your Tiiny Pocket. The Tiiny writes the summary, picks the category, works out
 where on earth it happened, scores how serious it is, and builds the embedding that groups
 related stories into developing threads.
@@ -19,7 +19,7 @@ You already own a device that can read. Daybreak gives it something to read all 
 
 It is genuinely useful as a news wall, but the reason it is worth building is that it shows
 you what your Tiiny can actually do when you stop poking at it one prompt at a time and
-give it a real job. Roughly 300 articles a day, every one of them summarised, classified,
+give it a real job. A thousand articles a day, every one of them summarised, classified,
 geotagged and embedded locally. It runs unattended for a week without being touched.
 
 ## Get it running in two minutes
@@ -40,6 +40,34 @@ python3 server.py          # the board itself
 
 Open http://localhost:8811 and watch it fill up. The database is created next to the
 scripts on first run. Delete it and start over any time you like.
+
+Or one command, if you would rather not run two:
+
+```bash
+python3 daybreak --serve                 # the wall on 8811, pipeline behind it
+python3 daybreak --serve --port 7871     # somewhere else
+```
+
+Same two things, one process, and Ctrl-C stops both. The two commands above still work
+and are what systemd runs on the Pi, because systemd wants one unit per thing it
+restarts. `python3 daybreak --selfcheck` builds a database, serves the wall on a spare
+loopback port, reads it back and exits, with no device and no network.
+
+### From tiinyapp.farm
+
+Daybreak is in the catalog, so on a machine that has the farm CLI:
+
+```bash
+farm install daybreak
+farm start daybreak            # or farm start daybreak --port 7871
+farm stop daybreak
+```
+
+The farm asks where your Tiiny is once, with `farm device`, and writes it to
+`~/.tiinyapps/device.json`. Daybreak reads that when `TIINY_HOST` and `TIINY_KEY` are
+not set, so there is nothing else to configure. With no device at all the wall still
+comes up, keeps collecting articles, and says on the page that nothing is being
+analysed yet. Name a device later and the queue drains in order from where it stopped.
 
 If something looks wrong, every module tests itself:
 
@@ -91,10 +119,10 @@ Images are capped. Both are tunable in the environment table below.
 ## Architecture
 
 ```
-                  14 free OSINT feeds   (RSS / Atom / RDF, keyless)
+                  59 free OSINT feeds   (RSS / Atom / RDF, keyless)
    BBC · Guardian · Al Jazeera · DW · France24 · Kyiv Independent · Times of Israel
-   Channel NewsAsia · Ukrinform · UN News · CISA advisories · USGS M4.5+
-   ReliefWeb · The Record
+   Channel NewsAsia · Ukrinform · UN News · CISA advisories · USGS quakes
+   ReliefWeb · The Record · NWS severe alerts · GDACS · and forty more (feeds.py)
                                        │
                                        │ 15 s timeout · a dead feed never stops the loop
                                        ▼
@@ -139,6 +167,9 @@ frontend only ever talks to our own `/api/*` on port 8811.
 
 ```
 daybreak/
+  daybreak             one command: the wall and the pipeline in one process
+  version.py           the version, in one place
+  LICENSE              MIT
   CONTRACT.md          build contract - the pinned interfaces
   schema.sql           sqlite schema (items, clusters, metrics, meta, docs)
   db.py                every DB access in the system
@@ -151,6 +182,8 @@ daybreak/
                        vault · idle (jobs.py) · r2
   server.py            daemon: HTTP API + static + camera proxy  (:8811)
   static/index.html    the board - one self-contained file, no CDN, no build
+  scripts/
+    release.py              builds the tar.gz that tiinyapp.farm lists
   deploy/
     install.sh              idempotent Pi installer
     daybreak.service        systemd: API + UI
@@ -280,8 +313,10 @@ sqlite3 /opt/daybreak/daybreak.db 'select count(*) from items'   # if sqlite3 is
 
 | Variable | Default | Notes |
 |---|---|---|
-| `TIINY_HOST` | `192.168.1.50` | host only; port is fixed at 8800 |
+| `TIINY_HOST` | `192.168.1.50` | host only; the gateway port is probed (80 on firmware 1.0, else 8800) or pinned with `TIINY_PORT` |
 | `TIINY_KEY` | - | **required**, server-side only, never sent to the browser |
+| `TIINY_BASE` | unset | what the farm exports; a full base URL, read when `TIINY_HOST` is unset |
+| `TIINYAPP_PORT` | unset | what the farm exports; the port, when `--port` is not given |
 | `DAYBREAK_DB` | `./daybreak.db` | `/opt/daybreak/daybreak.db` on the Pi |
 | `PORT` | `8811` | server.py listen port |
 | `BIND` | `127.0.0.1` | loopback only - the tunnel is the intended path in. Set `0.0.0.0` to also expose the (unauthenticated) board on the LAN |
@@ -303,7 +338,7 @@ sqlite3 /opt/daybreak/daybreak.db 'select count(*) from items'   # if sqlite3 is
 | Route | Returns |
 |---|---|
 | `GET /` | the board |
-| `GET /healthz` | liveness json |
+| `GET /healthz` | liveness json: `ok`, `version`, and `device` (is one configured) |
 | `GET /api/items?region&category&since&limit` | enriched articles, newest first (limit ≤ 200) |
 | `GET /api/clusters` | developing stories: label, count, top severity, 3 newest titles |
 | `GET /api/stats` | counts, meta, live device telemetry, 1 h series for the sparklines, plus `archive` (span/size of the permanent archive) and `docs` (dossier/synthesis/brief counts) |

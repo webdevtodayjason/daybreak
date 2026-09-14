@@ -92,6 +92,14 @@ canvas{display:block;max-width:100%;min-width:0}
   box-shadow:0 0 8px var(--accent);animation:blink 1.6s ease-in-out infinite}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:.25}}
 
+.nodev{display:flex;align-items:baseline;gap:12px;padding:9px 14px;
+  background:rgba(217,164,65,.08);border-bottom:1px solid rgba(217,164,65,.35);
+  font-size:11.5px;line-height:1.55;color:#cdb489}
+.nodev[hidden]{display:none}
+.nodev .k{flex:0 0 auto;font-size:9px;letter-spacing:.16em;color:var(--warn)}
+.nodev .t{flex:1 1 auto}
+.nodev code{font-family:inherit;color:#e8d9b6;background:rgba(217,164,65,.12);
+  padding:1px 5px;border-radius:3px}
 .leds{display:flex;align-items:center;gap:0;margin-left:auto}
 .led{
   display:flex;flex-direction:column;justify-content:center;gap:2px;
@@ -1209,6 +1217,18 @@ a.nm.hf:hover{color:#e8ebf2;border-bottom-color:#c8372d}
       </div>
     </div>
   </header>
+
+  <!-- ══ NO DEVICE ══ -->
+  <!-- Shown only when /api/stats says no Tiiny is configured. The wall and the
+       archive work without one; what stops is the analysis, and a board that goes
+       quiet without saying why looks broken instead of unconfigured. -->
+  <div class="nodev" id="noDevice" hidden>
+    <span class="k">NO TIINY</span>
+    <span class="t">Daybreak is collecting articles, and nothing is being summarised,
+    categorised, geotagged or clustered, because no device has been named. Set
+    <code>TIINY_HOST</code> and <code>TIINY_KEY</code>, or run <code>farm device</code>,
+    and the queue drains in order from where it stopped.</span>
+  </div>
 
   <!-- ══ FILTER BAR ══ -->
   <div class="filterbar">
@@ -3944,7 +3964,14 @@ function renderStats(){
   var dage = devAge;
   if(dage==null){ var dts=lastTs(sNpu); if(dts) dage=Math.max(0, Date.now()/1000-dts); }
   var dstate, dtext;
-  if(!devOnline){
+  var tiiny = st.tiiny||{};
+  if(tiiny.configured===false){
+    /* No device is not a broken device. An empty board with an amber "NO SERIES"
+       light reads as a Tiiny that died; this says the truth, which is that nobody
+       has told Daybreak where one is. The wall and the archive work regardless. */
+    dstate="warn";
+    dtext="NO DEVICE  ·  SET TIINY_HOST + TIINY_KEY, OR RUN farm device";
+  }else if(!devOnline){
     dstate="bad";
     dtext = dage==null ? "NO TELEMETRY" : ("OFFLINE  ·  LAST SEEN "+dur(dage)+" AGO");
   }else{
@@ -3953,6 +3980,8 @@ function renderStats(){
   }
   if(dstate==="ok") dtext = (npu==null?"":Math.round(npu)+"% NPU")+(tps!=null?("  ·  "+(tps>=100?Math.round(tps):tps.toFixed(1))+" T/S"):"");
   led("Tiiny", dstate, dtext);
+  var banner=$("noDevice");
+  if(banner) banner.hidden = (tiiny.configured!==false);
 }
 function led(which,state,text){
   var d=$("led"+which+"D"), v=$("led"+which+"V");

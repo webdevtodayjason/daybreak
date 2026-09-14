@@ -27,17 +27,80 @@ is precisely the one that must not silently opt out.
 """
 
 import contextlib
+import json
 import os
 import socket
 import sys
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 import time
 
 # Falls back to the production device. Every module used to carry its own default and
 # two of them carried a different one.
 DEFAULT_HOST = "192.168.1.50"
+
+# Where `farm device` writes what it was told. Somebody who installed Daybreak from
+# tiinyapp.farm has already answered "where is the Tiiny and what is the key" once,
+# to the farm, and should not have to answer it again to us. The farm also exports
+# TIINY_BASE and TIINY_KEY when it launches an app, so under `farm start` the
+# environment already carries it; this file is the answer for a hand start.
+FARM_DEVICE = os.path.join(os.path.expanduser("~"), ".tiinyapps", "device.json")
+
+
+def farm_device():
+    """{"base", "key"} as `farm device` wrote it, or an empty dict.
+
+    Never raises and never logs: a missing file is the normal case on a box that
+    has no farm, and the key inside is nobody's business but the device's.
+    """
+    try:
+        with open(FARM_DEVICE, "rb") as handle:
+            value = json.load(handle)
+        return value if isinstance(value, dict) else {}
+    except Exception:            # noqa: BLE001 - absent, unreadable or not JSON
+        return {}
+
+
+def _split_base(base):
+    """A base URL or a bare address as (host, explicit port or None)."""
+    base = (base or "").strip()
+    if not base:
+        return None, None
+    if "//" not in base:
+        base = "http://" + base
+    try:
+        parts = urllib.parse.urlsplit(base)
+        return (parts.hostname or None), parts.port
+    except ValueError:
+        return None, None
+
+
+def given():
+    """(host, explicit port or None, who said so), or (None, None, "").
+
+    In order: the environment the operator set, the environment the farm sets when
+    it launches an app, and the file `farm device` wrote. An empty answer is the
+    honest one on a box with no Tiiny, and it is what configured() reports.
+    """
+    for value, source_name in ((os.environ.get("TIINY_HOST"), "TIINY_HOST"),
+                               (os.environ.get("TIINY_BASE"), "TIINY_BASE"),
+                               (farm_device().get("base"), FARM_DEVICE)):
+        found, found_port = _split_base(value)
+        if found:
+            return found, found_port, source_name
+    return None, None, ""
+
+
+def configured():
+    """Is there a device to talk to at all: an address and a key."""
+    return bool(given()[0]) and bool(key())
+
+
+def source():
+    """Where the address came from, for a log line. Never includes the key."""
+    return given()[2] or "the built-in default"
 
 
 def _gateway_port(host, timeout=2.0):
@@ -74,29 +137,56 @@ _PORT_CACHE = {}
 
 
 def port():
-    """Gateway port, probed once and remembered."""
-    h = host()
-    if h not in _PORT_CACHE:
-        _PORT_CACHE[h] = _gateway_port(h)
-    return _PORT_CACHE[h]
+    """Gateway port: the override, then the one we were given, then a probe.
+
+    The probe costs two connection timeouts, and it is imported at module level by
+    server.py, so it must not run when there is nothing to ask. A box with no Tiiny
+    configured gets the answer immediately and the wall comes up in milliseconds.
+    """
+    override = os.environ.get("TIINY_PORT")
+    if override and override.strip().isdigit():
+        return int(override)
+    found, found_port, _ = given()
+    if found_port:
+        return found_port
+    if not found:
+        return 80
+    if found not in _PORT_CACHE:
+        _PORT_CACHE[found] = _gateway_port(found)
+    return _PORT_CACHE[found]
 
 
 # Kept for callers that import it directly. Prefer port().
 PORT = 8800
 
-# Outside /tmp (namespaced per unit) and outside any home directory (ProtectHome=yes
-# blocks those). Set before anything imports onelane, so a unit lacking the env file
-# still lands in the shared directory instead of its own private /tmp.
-LOCK_DIR = os.environ.get("ONELANE_DIR") or "/var/lib/daybreak/locks"
+def _lock_dir():
+    """One directory every unit can see, chosen without needing root to exist.
+
+    On the Pi that is /var/lib/daybreak/locks: outside /tmp (namespaced per unit
+    by PrivateTmp=yes) and outside any home directory (ProtectHome=yes blocks
+    those), and install.sh creates it. Off the Pi there is no installer and
+    /var/lib is not ours to write, so fall back to one directory under this
+    user's home. Same property that matters, one spelling per user, and it beats
+    silently landing somewhere unwritable and coordinating nobody.
+    """
+    told = os.environ.get("ONELANE_DIR")
+    if told:
+        return told
+    shared = "/var/lib/daybreak/locks"
+    if os.path.isdir(shared) or os.access("/var/lib", os.W_OK):
+        return shared
+    return os.path.join(os.path.expanduser("~"), ".daybreak", "locks")
+
+
+# Set before anything imports onelane, so a unit lacking the env file still lands in
+# the shared directory instead of its own private /tmp.
+LOCK_DIR = _lock_dir()
 os.environ["ONELANE_DIR"] = LOCK_DIR
 
 
 def host():
     """The bare host: no scheme, no port. This is the string onelane keys on."""
-    raw = (os.environ.get("TIINY_HOST") or DEFAULT_HOST).strip()
-    if "//" in raw:
-        raw = raw.split("//", 1)[1]
-    return raw.strip("/ ").split("/")[0].split(":")[0]
+    return given()[0] or DEFAULT_HOST
 
 
 def base_url():
@@ -104,8 +194,12 @@ def base_url():
 
 
 def key():
-    """Empty is allowed here and must fail loudly at call time, not at import."""
-    return os.environ.get("TIINY_KEY", "")
+    """Empty is allowed here and must fail loudly at call time, not at import.
+
+    TIINY_KEY first, then whatever `farm device` was told. Nothing anywhere in this
+    tree prints the return value.
+    """
+    return (os.environ.get("TIINY_KEY") or farm_device().get("key") or "").strip()
 
 
 def prove_shared(unit, quiet=False):
@@ -205,7 +299,18 @@ def holder():
 
 
 if __name__ == "__main__":
-    assert host() == "192.168.1.50" or os.environ.get("TIINY_HOST"), host()
+    import tempfile
+
+    # This box may well have a real ~/.tiinyapps/device.json, and the assertions below
+    # are about what happens when nothing says where the device is. Point the constant
+    # at a directory that has no such file, and put one back when we want to read it.
+    _real_farm_device, _scratch = FARM_DEVICE, tempfile.mkdtemp(prefix="daybreak-dev-")
+    FARM_DEVICE = os.path.join(_scratch, "device.json")
+    for _leftover in ("TIINY_HOST", "TIINY_BASE", "TIINY_KEY", "TIINY_PORT"):
+        os.environ.pop(_leftover, None)
+
+    assert host() == DEFAULT_HOST, host()
+    assert not configured(), "no address and no key is not configured"
     for spelling in ("1.2.3.4", "http://1.2.3.4", "http://1.2.3.4:8800", "1.2.3.4:8800/"):
         os.environ["TIINY_HOST"] = spelling
         assert host() == "1.2.3.4", (spelling, host())
@@ -220,4 +325,30 @@ if __name__ == "__main__":
     _PORT_CACHE.clear()
     assert host() == DEFAULT_HOST
     assert os.environ["ONELANE_DIR"] == LOCK_DIR
+
+    # The farm's file answers when the environment does not, and the environment
+    # still wins over it. The key is compared, never printed.
+    with open(FARM_DEVICE, "w") as fh:
+        json.dump({"base": "http://10.0.0.9:8800", "key": "farm-written-key"}, fh)
+    assert host() == "10.0.0.9", host()
+    assert port() == 8800, port()
+    assert base_url() == "http://10.0.0.9:8800", base_url()
+    assert key() == "farm-written-key"
+    assert configured(), "an address and a key is configured"
+    assert source() == FARM_DEVICE, source()
+    os.environ["TIINY_HOST"] = "10.0.0.10"
+    os.environ["TIINY_KEY"] = "env-key"
+    assert host() == "10.0.0.10" and key() == "env-key", (host(), source())
+    assert source() == "TIINY_HOST", source()
+    del os.environ["TIINY_HOST"], os.environ["TIINY_KEY"]
+
+    # A file that is not there, not readable or not JSON is the same as no file.
+    os.remove(FARM_DEVICE)
+    assert farm_device() == {} and host() == DEFAULT_HOST
+    with open(FARM_DEVICE, "w") as fh:
+        fh.write("this is not json")
+    assert farm_device() == {} and not configured()
+    os.remove(FARM_DEVICE)
+    os.rmdir(_scratch)
+    FARM_DEVICE = _real_farm_device
     print("device.py self-check OK -> %s, locks in %s" % (base_url(), LOCK_DIR))

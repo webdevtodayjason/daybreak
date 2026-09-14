@@ -40,6 +40,7 @@ if BASE_DIR not in sys.path:
 
 import db  # noqa: E402
 import device
+from version import VERSION
 
 PORT = int(os.environ.get("PORT", "8811"))
 # Loopback by default: the board is unauthenticated and the cloudflared tunnel is the
@@ -48,7 +49,10 @@ BIND = os.environ.get("BIND", "127.0.0.1")
 DB_PATH = os.environ.get("DAYBREAK_DB") or os.path.join(BASE_DIR, "daybreak.db")
 CAM_URL = (os.environ.get("CAM_URL") or "http://127.0.0.1:8812").rstrip("/")
 TIINY_BASE = device.base_url()
-TIINY_KEY = os.environ.get("TIINY_KEY", "")
+# device.key() so an install from tiinyapp.farm works without an env file: the farm
+# already asked for the key once and wrote it to ~/.tiinyapps/device.json. It is read
+# here, sent to the device, and printed nowhere; the browser only ever sees /api/*.
+TIINY_KEY = device.key()
 IMAGE_MODEL = os.environ.get("IMAGE_MODEL", "Tongyi-MAI/Z-Image-Turbo")
 PUBLIC_BASE = (os.environ.get("DAYBREAK_PUBLIC_BASE") or "https://daybreak.example.com").rstrip("/")
 SITE_DESC_FALLBACK = "Daily world-news brief, written and spoken on a Tiiny Pocket edge device."
@@ -821,7 +825,12 @@ class Handler(BaseHTTPRequestHandler):
                 con.close()
         except Exception:
             ok = False
-        self.json(200 if ok else 503, {"ok": ok, "ts": time.time(), "db": DB_PATH})
+        # version is what tiinyapp.farm reads off this route to say which build is
+        # running; device says whether there is a Tiiny to talk to at all, which is
+        # the one thing a fresh install most often gets wrong.
+        self.json(200 if ok else 503,
+                  {"ok": ok, "ts": time.time(), "db": DB_PATH,
+                   "version": VERSION, "device": device.configured()})
 
     def r_items(self, q):
         region = _first(q, "region")
@@ -1323,6 +1332,14 @@ class Handler(BaseHTTPRequestHandler):
         # An older index.html ignores them; nothing it reads moved.
         payload = {"counts": {}, "meta": {}, "device": {}, "series": {},
                    "archive": {}, "docs": {}}
+        # Additive, like archive and docs before it: whether a Tiiny is configured at
+        # all, and where we were told about it. Never the key. A board with no device
+        # showed six empty gauges and an amber telemetry light, which reads as a
+        # broken device rather than an absent one.
+        payload["tiiny"] = {"configured": device.configured(),
+                            "base": TIINY_BASE if device.configured() else "",
+                            "source": device.source(),
+                            "version": VERSION}
         try:
             payload["host"] = host_stats()
         except Exception as exc:
@@ -1600,7 +1617,10 @@ def selfcheck():
                           daemon=True)
     th.start()
     rc = 0
-    for path in ("/healthz", "/api/items?limit=5", "/api/clusters", "/api/stats",
+    # "/" first: the wall itself is the thing being checked, and a board that
+    # serves every API route and then 500s on the page is a passing check and a
+    # blank screen. /cam.jpg and /nope are the two that are meant to fail.
+    for path in ("/", "/healthz", "/api/items?limit=5", "/api/clusters", "/api/stats",
                  "/cam.jpg", "/nope"):
         url = "http://%s:%d%s" % (host, port, path)
         try:
