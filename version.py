@@ -5,4 +5,4 @@ there when it lists an app), and scripts/release.py names the archive with it.
 Three copies of a version number is two copies too many.
 """
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
