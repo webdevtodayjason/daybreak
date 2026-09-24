@@ -193,6 +193,35 @@ def base_url():
     return "http://%s:%d" % (host(), port())
 
 
+def account_auth_key(addr, serial, password):
+    """The device's own static API key, straight from the box, no TiinyOS.
+
+    POST /api/v1/account/auth (password + serial), Host: auth.api.tiiny,
+    unlocks /data and hands back `auth_key` -- the same 36-char UUID key()
+    below looks for. Confirmed 2026-09-24 against a live device. Full
+    writeup: ~/code/tiiny/tools/README-unlock.md.
+
+    Deliberately NOT wired into key(): this server runs unattended (a
+    reboot, a Coolify redeploy) with nothing to answer a password prompt,
+    and key() itself is documented to never block or print. This is a
+    plain capability for an operator's own one-off use -- get a key once,
+    same way tiiny-unlock.py does, and put it in TIINY_KEY or the farm
+    device file, which key() already reads. Returns "" on any failure.
+    """
+    body = json.dumps({"password": password, "device_id": serial}).encode()
+    req = urllib.request.Request(
+        "http://%s/api/v1/account/auth" % addr, data=body, method="POST",
+        headers={"Content-Type": "application/json", "Host": "auth.api.tiiny",
+                 "x-device-id": serial, "accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            out = json.loads(resp.read().decode())
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError,
+            ValueError, OSError):
+        return ""
+    return (out.get("auth_key") or "").strip()
+
+
 def key():
     """Empty is allowed here and must fail loudly at call time, not at import.
 
@@ -439,6 +468,35 @@ if __name__ == "__main__":
             assert _lane.who()["why"] == "inner", _lane.who()
         assert _lane.who()["why"] == "outer", _lane.who()
     assert _lane.who()["held"] is False and _lane.who()["queue"] == 0
+
+    # account_auth_key(): parses what the device actually sends, against a
+    # tiny stub, same as the check in tools/tiiny-unlock.py.
+    import threading as _threading
+    from http.server import BaseHTTPRequestHandler as _BHRH, ThreadingHTTPServer as _THS
+
+    class _Handler(_BHRH):
+        reply = {"status": "ok", "auth_key": "the-real-key"}
+        status = 200
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            body = json.dumps(self.reply).encode()
+            self.send_response(self.status)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    _srv = _THS(("127.0.0.1", 0), _Handler)
+    _addr = "127.0.0.1:%d" % _srv.server_port
+    _threading.Thread(target=_srv.serve_forever, daemon=True).start()
+    assert account_auth_key(_addr, "TNYM000", "x") == "the-real-key"
+    _Handler.reply, _Handler.status = {"error": "main_password_wrong"}, 403
+    assert account_auth_key(_addr, "TNYM000", "wrong") == ""
+    assert account_auth_key("127.0.0.1:1", "TNYM000", "x") == ""
+    _srv.shutdown()
 
     print("device.py self-check OK -> %s, locks in %s, lane %s"
           % (base_url(), LOCK_DIR, "onelane" if coordinated() else "local (no onelane)"))
